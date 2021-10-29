@@ -4,6 +4,7 @@ go 1.13
 
 require (
 	github.com/at-wat/ebml-go v0.16.0
+	github.com/golang-jwt/jwt/v4 v4.1.0
 	github.com/gorilla/websocket v1.4.2
 	github.com/jech/cert v0.0.0-20210819231831-aca735647728
 	github.com/jech/samplebuilder v0.0.0-20210823163459-dd92d75bae48

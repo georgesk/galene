@@ -324,11 +324,33 @@ function setConnected(connected) {
 }
 
 /** @this {ServerConnection} */
-function gotConnected() {
+async function gotConnected() {
     setConnected(true);
     let up = getUserPass();
     try {
-        this.join(group, up.username, up.password);
+        if(!groupStatus.authServer) {
+            this.join(group, up.username, up.password);
+        } else {
+            let r = await fetch(groupStatus.authServer, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    group: group,
+                    username: up.username,
+                    password: up.password,
+                }),
+            });
+            if(!r.ok) {
+                displayError(
+                    `The authorisation server said: ${r.status} ${r.statusText}`,
+                )
+                return
+            }
+            let token = await r.text();
+            this.join(group, up.username, null, token);
+        }
     } catch(e) {
         console.error(e);
         displayError(e);

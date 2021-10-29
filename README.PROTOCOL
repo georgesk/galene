@@ -39,6 +39,11 @@ configuration file.  Each object has the following fields:
  - `locked`: true if the group is locked;
  - `clientCount`: the number of clients currently in the group.
 
+If token-based authorisation is in use for the group, then the dictionary
+contains the following additional field:
+
+ - `authServer`: the URL of the authorisation server.
+
 A client may also fetch the URL `/group/name/.status.json` to retrieve the
 status of a single group.  If the group has not been marked as public,
 then the fields `locked` and `clientCount` are omitted.
@@ -110,6 +115,9 @@ The `join` message requests that the sender join or leave a group:
     password: password
 }
 ```
+
+If token-based authorisation is beling used, then the `password` field is
+omitted, and a `token` field is included instead.
 
 When the sender has effectively joined the group, the peer will send
 a 'joined' message of kind 'join'; it may then send a 'joined' message of

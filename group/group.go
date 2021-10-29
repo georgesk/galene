@@ -15,6 +15,8 @@ import (
 	"github.com/pion/ice/v2"
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v3"
+
+	"github.com/jech/galene/token"
 )
 
 var Directory, DataDirectory string
@@ -929,6 +931,12 @@ type Description struct {
 	// A list of logins for non-presenting users.
 	Other []ClientPattern `json:"other,omitempty"`
 
+	// The URL of the authentication server.
+	AuthServer string `json:"authServer"`
+
+	// The (public) keys of the authentication server
+	AuthKeys []map[string]interface{} `json:"authKeys"`
+
 	// Codec preferences.  If empty, a suitable default is chosen in
 	// the APIFromNames function.
 	Codecs []string `json:"codecs,omitempty"`
@@ -1031,6 +1039,7 @@ func (desc *Description) GetPermission(group string, creds ClientCredentials) (C
 	if !desc.AllowAnonymous && creds.Username == "" {
 		return p, ErrAnonymousNotAuthorised
 	}
+
 	if found, good := matchClient(group, creds, desc.Op); found {
 		if good {
 			p.Op = true
@@ -1055,6 +1064,21 @@ func (desc *Description) GetPermission(group string, creds ClientCredentials) (C
 		}
 		return p, ErrNotAuthorised
 	}
+
+	if desc.AuthServer != "" && creds.Token != "" {
+		perms, err := token.Valid(
+			creds.Username, group, creds.Token, desc.AuthKeys,
+		)
+		if err != nil {
+			log.Printf("Token authentication: %v", err)
+			return p, ErrNotAuthorised
+		}
+		p.Op, _ = perms["op"].(bool)
+		p.Present, _ = perms["present"].(bool)
+		p.Record, _ = perms["record"].(bool)
+		return p, nil
+	}
+
 	return p, ErrNotAuthorised
 }
 
@@ -1062,6 +1086,7 @@ type Status struct {
 	Name        string `json:"name"`
 	DisplayName string `json:"displayName,omitempty"`
 	Description string `json:"description,omitempty"`
+	AuthServer  string `json:"authServer,omitempty"`
 	Locked      bool   `json:"locked,omitempty"`
 	ClientCount *int   `json:"clientCount,omitempty"`
 }
@@ -1071,6 +1096,7 @@ func GetStatus(g *Group, authentified bool) Status {
 	d := Status{
 		Name:        g.name,
 		DisplayName: desc.DisplayName,
+		AuthServer:  desc.AuthServer,
 		Description: desc.Description,
 	}
 
