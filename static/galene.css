@@ -583,6 +583,7 @@ textarea.form-reply {
     position: relative;
     display: flex;
     justify-content: center;
+    overflow: scroll;
 }
 
 .login-box {
@@ -992,7 +993,7 @@ h1 {
     padding: 10px;
     background: #fff;
     height: calc(100% - 56px);
-    overflow-y: scroll;
+    overflow-y: auto;
     overflow-x: hidden;
 }
 

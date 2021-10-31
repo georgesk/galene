@@ -56,7 +56,6 @@ type webClient struct {
 	group       *group.Group
 	id          string
 	username    string
-	password    string
 	permissions group.ClientPermissions
 	status      map[string]interface{}
 	requested   map[string][]string
@@ -88,18 +87,6 @@ func (c *webClient) Username() string {
 	return c.username
 }
 
-func (c *webClient) Challenge(group string, creds group.ClientCredentials) bool {
-	if creds.Password == nil {
-		return true
-	}
-	m, err := creds.Password.Match(c.password)
-	if err != nil {
-		log.Printf("Password match: %v", err)
-		return false
-	}
-	return m
-}
-
 func (c *webClient) Permissions() group.ClientPermissions {
 	return c.permissions
 }
@@ -127,9 +114,10 @@ type clientMessage struct {
 	Dest             string                   `json:"dest,omitempty"`
 	Username         string                   `json:"username,omitempty"`
 	Password         string                   `json:"password,omitempty"`
+	Token            string                   `json:"token,omitempty"`
 	Privileged       bool                     `json:"privileged,omitempty"`
 	Permissions      *group.ClientPermissions `json:"permissions,omitempty"`
-	Status           map[string]interface{}   `json:"status,omitempty"`
+	Status           interface{}              `json:"status,omitempty"`
 	Group            string                   `json:"group,omitempty"`
 	Value            interface{}              `json:"value,omitempty"`
 	NoEcho           bool                     `json:"noecho,omitempty"`
@@ -216,9 +204,12 @@ func delUpConn(c *webClient, id string, userId string, push bool) error {
 		c.mu.Unlock()
 		return os.ErrNotExist
 	}
-	if userId != "" && conn.userId != userId {
-		c.mu.Unlock()
-		return ErrUserMismatch
+	if userId != "" {
+		id, _ := conn.User()
+		if id != userId {
+			c.mu.Unlock()
+			return ErrUserMismatch
+		}
 	}
 
 	replace := conn.getReplace(false)
@@ -370,7 +361,7 @@ func addDownTrackUnlocked(conn *rtpDownConnection, remoteTrack *rtpUpTrack) erro
 		id = remoteTrack.track.Kind().String()
 	}
 	msid := remoteTrack.track.StreamID()
-	if msid == "" {
+	if msid == "" || msid == "-" {
 		log.Println("Got track with empty msid")
 		msid = remoteTrack.conn.Label()
 	}
@@ -581,8 +572,6 @@ func gotOffer(c *webClient, id, label string, sdp string, replace string) error 
 		return err
 	}
 
-	up.userId = c.Id()
-	up.username = c.Username()
 	if replace != "" {
 		up.replace = replace
 		delUpConn(c, replace, c.Id(), false)
@@ -828,21 +817,6 @@ func (c *webClient) PushConn(g *group.Group, id string, up conn.Up, tracks []con
 		return err
 	}
 	return nil
-}
-
-func getGroupStatus(g *group.Group) map[string]interface{} {
-	status := make(map[string]interface{})
-	if locked, message := g.Locked(); locked {
-		if message == "" {
-			status["locked"] = true
-		} else {
-			status["locked"] = message
-		}
-	}
-	if dn := g.DisplayName(); dn != "" {
-		status["displayName"] = dn
-	}
-	return status
 }
 
 func readMessage(conn *websocket.Conn, m *clientMessage) error {
@@ -1137,11 +1111,11 @@ func handleAction(c *webClient, a interface{}) error {
 			Status:      a.status,
 		})
 	case joinedAction:
-		var status map[string]interface{}
+		var status interface{}
 		if a.group != "" {
 			g := group.Get(a.group)
 			if g != nil {
-				status = getGroupStatus(g)
+				status = group.GetStatus(g, true)
 			}
 		}
 		perms := c.permissions
@@ -1166,7 +1140,7 @@ func handleAction(c *webClient, a interface{}) error {
 			Group:            g.Name(),
 			Username:         c.username,
 			Permissions:      &perms,
-			Status:           getGroupStatus(g),
+			Status:           group.GetStatus(g, true),
 			RTCConfiguration: ice.ICEConfiguration(),
 		})
 		if !c.permissions.Present {
@@ -1282,7 +1256,7 @@ func setPermissions(g *group.Group, id string, perm string) error {
 	switch perm {
 	case "op":
 		c.permissions.Op = true
-		if g.AllowRecording() {
+		if g.Description().AllowRecording {
 			c.permissions.Record = true
 		}
 	case "unop":
@@ -1347,8 +1321,13 @@ func handleClientMessage(c *webClient, m clientMessage) error {
 			return group.ProtocolError("cannot join multiple groups")
 		}
 		c.username = m.Username
-		c.password = m.Password
-		g, err := group.AddClient(m.Group, c)
+		g, err := group.AddClient(m.Group, c,
+			group.ClientCredentials{
+				Username: m.Username,
+				Password: m.Password,
+				Token:    m.Token,
+			},
+		)
 		if err != nil {
 			var s string
 			if os.IsNotExist(err) {
@@ -1356,6 +1335,8 @@ func handleClientMessage(c *webClient, m clientMessage) error {
 			} else if err == group.ErrNotAuthorised {
 				s = "not authorised"
 				time.Sleep(200 * time.Millisecond)
+			} else if err == group.ErrAnonymousNotAuthorised {
+				s = "please choose a username"
 			} else if e, ok := err.(group.UserError); ok {
 				s = string(e)
 			} else {
@@ -1371,7 +1352,7 @@ func handleClientMessage(c *webClient, m clientMessage) error {
 				Value:       s,
 			})
 		}
-		if redirect := g.Redirect(); redirect != "" {
+		if redirect := g.Description().Redirect; redirect != "" {
 			// We normally redirect at the HTTP level, but the group
 			// description could have been edited in the meantime.
 			return c.write(clientMessage{
@@ -1585,7 +1566,11 @@ func handleClientMessage(c *webClient, m clientMessage) error {
 				}
 			}
 			disk := diskwriter.New(g)
-			_, err := group.AddClient(g.Name(), disk)
+			_, err := group.AddClient(g.Name(), disk,
+				group.ClientCredentials{
+					System: true,
+				},
+			)
 			if err != nil {
 				disk.Close()
 				return c.error(err)

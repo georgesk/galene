@@ -76,7 +76,7 @@ func (p Password) MarshalJSON() ([]byte, error) {
 	return json.Marshal(RawPassword(p))
 }
 
-type ClientCredentials struct {
+type ClientPattern struct {
 	Username string    `json:"username,omitempty"`
 	Password *Password `json:"password,omitempty"`
 }
@@ -88,16 +88,17 @@ type ClientPermissions struct {
 	System  bool `json:"system,omitempty"`
 }
 
-type Challengeable interface {
-	Username() string
-	Givenpassword() string
-	Challenge(string, ClientCredentials) bool
+type ClientCredentials struct {
+	System   bool
+	Username string
+	Password string
+	Token    string
 }
 
 type Client interface {
 	Group() *Group
 	Id() string
-	Challengeable
+	Username() string
 	Permissions() ClientPermissions
 	SetPermissions(ClientPermissions)
 	Status() map[string]interface{}

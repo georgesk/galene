@@ -1,7 +1,6 @@
 package webserver
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/json"
@@ -32,8 +31,6 @@ import (
 var server atomic.Value
 
 var StaticRoot string
-
-var Redirect string
 
 var Insecure bool
 
@@ -70,10 +67,7 @@ func Serve(address string, dataDir string) error {
 		}
 	}
 	s.RegisterOnShutdown(func() {
-		group.Range(func(g *group.Group) bool {
-			go g.Shutdown("server is shutting down")
-			return true
-		})
+		group.Shutdown("server is shutting down")
 	})
 
 	server.Store(s)
@@ -92,9 +86,13 @@ func Serve(address string, dataDir string) error {
 	return err
 }
 
-func mungeHeader(w http.ResponseWriter) {
+func cspHeader(w http.ResponseWriter, connect string) {
+	c := "connect-src ws: wss: 'self';"
+	if connect != "" {
+		c = "connect-src " + connect + " ws: wss: 'self';"
+	}
 	w.Header().Add("Content-Security-Policy",
-		"connect-src ws: wss: 'self'; img-src data: 'self'; media-src blob: 'self'; default-src 'self'")
+		c + " img-src data: 'self'; media-src blob: 'self'; default-src 'self'")
 }
 
 func notFound(w http.ResponseWriter) {
@@ -134,13 +132,18 @@ const (
 )
 
 func redirect(w http.ResponseWriter, r *http.Request) bool {
-	if Redirect == "" || strings.EqualFold(r.Host, Redirect) {
+	conf, err := group.GetConfiguration()
+	if err != nil || conf.CanonicalHost == "" {
+		return false
+	}
+
+	if strings.EqualFold(r.Host, conf.CanonicalHost) {
 		return false
 	}
 
 	u := url.URL{
 		Scheme: "https",
-		Host:   Redirect,
+		Host:   conf.CanonicalHost,
 		Path:   r.URL.Path,
 	}
 	http.Redirect(w, r, u.String(), http.StatusMovedPermanently)
@@ -175,7 +178,7 @@ func (fh *fileHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mungeHeader(w)
+	cspHeader(w, "")
 	p := r.URL.Path
 	// this ensures any leading .. are removed by path.Clean below
 	if !strings.HasPrefix(p, "/") {
@@ -265,6 +268,10 @@ func parseGroupName(prefix string, p string) string {
 		return ""
 	}
 
+	if name[0] == '.' {
+		return ""
+	}
+
 	if filepath.Separator != '/' &&
 		strings.ContainsRune(name, filepath.Separator) {
 		return ""
@@ -279,15 +286,14 @@ func groupHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	mungeHeader(w)
-	name := parseGroupName("/group/", r.URL.Path)
-	if name == "" {
-		notFound(w)
+	if strings.HasSuffix(r.URL.Path, "/.status.json") {
+		groupStatusHandler(w, r)
 		return
 	}
 
-	if r.URL.Path != "/group/"+name {
-		http.Redirect(w, r, "/group/"+name, http.StatusPermanentRedirect)
+	name := parseGroupName("/group/", r.URL.Path)
+	if name == "" {
+		notFound(w)
 		return
 	}
 
@@ -296,19 +302,59 @@ func groupHandler(w http.ResponseWriter, r *http.Request) {
 		if os.IsNotExist(err) {
 			notFound(w)
 		} else {
-			log.Printf("addGroup: %v", err)
+			log.Printf("group.Add: %v", err)
 			http.Error(w, "Internal server error",
 				http.StatusInternalServerError)
 		}
 		return
 	}
 
-	if redirect := g.Redirect(); redirect != "" {
+	if r.URL.Path != "/group/"+name+"/" {
+		http.Redirect(w, r, "/group/"+name+"/",
+			http.StatusPermanentRedirect)
+		return
+	}
+
+	if redirect := g.Description().Redirect; redirect != "" {
 		http.Redirect(w, r, redirect, http.StatusPermanentRedirect)
 		return
 	}
 
+	status := group.GetStatus(g, false)
+	cspHeader(w, status.AuthServer)
 	serveFile(w, r, filepath.Join(StaticRoot, "galene.html"))
+}
+
+func groupStatusHandler(w http.ResponseWriter, r *http.Request) {
+	path := path.Dir(r.URL.Path)
+	name := parseGroupName("/group/", path)
+	if name == "" {
+		notFound(w)
+		return
+	}
+
+	g, err := group.Add(name, nil)
+	if err != nil {
+		if os.IsNotExist(err) {
+			notFound(w)
+		} else {
+			http.Error(w, "Internal server error",
+				http.StatusInternalServerError)
+		}
+		return
+	}
+
+	d := group.GetStatus(g, false)
+	w.Header().Set("content-type", "application/json")
+	w.Header().Set("cache-control", "no-cache")
+
+	if r.Method == "HEAD" {
+		return
+	}
+
+	e := json.NewEncoder(w)
+	e.Encode(d)
+	return
 }
 
 func publicHandler(w http.ResponseWriter, r *http.Request) {
@@ -325,26 +371,20 @@ func publicHandler(w http.ResponseWriter, r *http.Request) {
 	return
 }
 
-func getPassword(dataDir string) (string, string, error) {
-	f, err := os.Open(filepath.Join(dataDir, "passwd"))
+func adminMatch(username, password string) (bool, error) {
+	conf, err := group.GetConfiguration()
 	if err != nil {
-		return "", "", err
-	}
-	defer f.Close()
-
-	r := bufio.NewReader(f)
-
-	s, err := r.ReadString('\n')
-	if err != nil {
-		return "", "", err
+		return false, err
 	}
 
-	l := strings.SplitN(strings.TrimSpace(s), ":", 2)
-	if len(l) != 2 {
-		return "", "", errors.New("couldn't parse passwords")
+	for _, cred := range conf.Admin {
+		if cred.Username == "" || cred.Username == username {
+			if ok, _ := cred.Password.Match(password); ok {
+				return true, nil
+			}
+		}
 	}
-
-	return l[0], l[1], nil
+	return false, nil
 }
 
 func failAuthentication(w http.ResponseWriter, realm string) {
@@ -354,15 +394,16 @@ func failAuthentication(w http.ResponseWriter, realm string) {
 }
 
 func statsHandler(w http.ResponseWriter, r *http.Request, dataDir string) {
-	u, p, err := getPassword(dataDir)
-	if err != nil {
-		log.Printf("Passwd: %v", err)
+	username, password, ok := r.BasicAuth()
+	if !ok {
 		failAuthentication(w, "stats")
 		return
 	}
 
-	username, password, ok := r.BasicAuth()
-	if !ok || username != u || password != p {
+	if ok, err := adminMatch(username, password); !ok {
+		if err != nil {
+			log.Printf("Administrator password: %v", err)
+		}
 		failAuthentication(w, "stats")
 		return
 	}
@@ -375,7 +416,7 @@ func statsHandler(w http.ResponseWriter, r *http.Request, dataDir string) {
 
 	ss := stats.GetGroups()
 	e := json.NewEncoder(w)
-	err = e.Encode(ss)
+	err := e.Encode(ss)
 	if err != nil {
 		log.Printf("stats.json: %v", err)
 	}
@@ -536,31 +577,6 @@ func handleGroupAction(w http.ResponseWriter, r *http.Request, group string) {
 	}
 }
 
-type httpClient struct {
-	username string
-	password string
-}
-
-func (c httpClient) Username() string {
-	return c.username
-}
-
-func (c httpClient) Givenpassword() string {
-	return c.password
-}
-
-func (c httpClient) Challenge(group string, creds group.ClientCredentials) bool {
-	if creds.Password == nil {
-		return true
-	}
-	m, err := creds.Password.Match(c.password)
-	if err != nil {
-		log.Printf("Password match: %v", err)
-		return false
-	}
-	return m
-}
-
 func checkGroupPermissions(w http.ResponseWriter, r *http.Request, groupname string) bool {
 	desc, err := group.GetDescription(groupname)
 	if err != nil {
@@ -572,7 +588,12 @@ func checkGroupPermissions(w http.ResponseWriter, r *http.Request, groupname str
 		return false
 	}
 
-	p, err := desc.GetPermission(groupname, httpClient{user, pass})
+	p, err := desc.GetPermission(groupname,
+		group.ClientCredentials{
+			Username: user,
+			Password: pass,
+		},
+	)
 	if err != nil || !p.Record {
 		if err == group.ErrNotAuthorised {
 			time.Sleep(200 * time.Millisecond)

@@ -16,14 +16,16 @@ import (
 	"github.com/pion/ice/v2"
 	"github.com/pion/sdp/v3"
 	"github.com/pion/webrtc/v3"
-	"github.com/go-ldap/ldap/v3"
+
+	"github.com/jech/galene/token"
 )
 
-var Directory string
+var Directory, DataDirectory string
 var UseMDNS bool
 var UDPMin, UDPMax uint16
 
 var ErrNotAuthorised = errors.New("not authorised")
+var ErrAnonymousNotAuthorised = errors.New("anonymous users not authorised in this group")
 
 type UserError string
 
@@ -107,28 +109,16 @@ func (g *Group) SetLocked(locked bool, message string) {
 	}
 }
 
-func (g *Group) Public() bool {
+func (g *Group) Description() *Description {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.description.Public
+	return g.description
 }
 
-func (g *Group) Redirect() string {
+func (g *Group) ClientCount() int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.description.Redirect
-}
-
-func (g *Group) AllowRecording() bool {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.description.AllowRecording
-}
-
-func (g *Group) DisplayName() string {
-	g.mu.Lock()
-	defer g.mu.Unlock()
-	return g.description.DisplayName
+	return len(g.clients)
 }
 
 func (g *Group) EmptyTime() time.Duration {
@@ -497,7 +487,9 @@ func GetSubGroups(parent string) []SubGroup {
 func Get(name string) *Group {
 	groups.mu.Lock()
 	defer groups.mu.Unlock()
-
+	if groups.groups == nil {
+		return nil
+	}
 	return groups.groups[name]
 }
 
@@ -524,7 +516,7 @@ func deleteUnlocked(g *Group) bool {
 	return true
 }
 
-func AddClient(group string, c Client) (*Group, error) {
+func AddClient(group string, c Client, creds ClientCredentials) (*Group, error) {
 	g, err := Add(group, nil)
 	if err != nil {
 		return nil, err
@@ -536,7 +528,7 @@ func AddClient(group string, c Client) (*Group, error) {
 	clients := g.getClientsUnlocked(nil)
 
 	if !c.Permissions().System {
-		perms, err := g.description.GetPermission(group, c)
+		perms, err := g.description.GetPermission(group, creds)
 		if err != nil {
 			return nil, err
 		}
@@ -700,8 +692,12 @@ func kickall(g *Group, message string) {
 	})
 }
 
-func (g *Group) Shutdown(message string) {
-	kickall(g, message)
+func Shutdown(message string) {
+	Range(func(g *Group) bool {
+		g.SetLocked(true, message)
+		kickall(g, message)
+		return true
+	})
 }
 
 type warner interface {
@@ -783,12 +779,16 @@ func (g *Group) GetChatHistory() []ChatHistoryEntry {
 	return h
 }
 
-func matchClient(group string, c Challengeable, users []ClientCredentials) (bool, bool) {
+func matchClient(group string, creds ClientCredentials, users []ClientPattern) (bool, bool) {
 	matched := false
 	for _, u := range users {
-		if u.Username == c.Username() {
+		if u.Username == creds.Username {
 			matched = true
-			if c.Challenge(group, u) {
+			if u.Password == nil {
+				return true, true
+			}
+			m, _ := u.Password.Match(creds.Password)
+			if m {
 				return true, true
 			}
 		}
@@ -799,7 +799,11 @@ func matchClient(group string, c Challengeable, users []ClientCredentials) (bool
 
 	for _, u := range users {
 		if u.Username == "" {
-			if c.Challenge(group, u) {
+			if u.Password == nil {
+				return true, true
+			}
+			m, _ := u.Password.Match(creds.Password)
+			if m {
 				return true, true
 			}
 		}
@@ -807,8 +811,68 @@ func matchClient(group string, c Challengeable, users []ClientCredentials) (bool
 	return false, false
 }
 
-// Type Description represents a group description together with some
-// metadata about the JSON file it was deserialised from.
+// Configuration represents the contents of the data/config.json file.
+type Configuration struct {
+	// The modtime and size of the file.  These are used to detect
+	// when a file has changed on disk.
+	modTime  time.Time `json:"-"`
+	fileSize int64     `json:"-"`
+
+	CanonicalHost string          `json:"canonicalHost"`
+	Admin         []ClientPattern `json:"admin"`
+}
+
+var configuration struct {
+	mu            sync.Mutex
+	configuration *Configuration
+}
+
+func GetConfiguration() (*Configuration, error) {
+	configuration.mu.Lock()
+	defer configuration.mu.Unlock()
+
+	if configuration.configuration == nil {
+		configuration.configuration = &Configuration{}
+	}
+
+	filename := filepath.Join(DataDirectory, "config.json")
+	fi, err := os.Stat(filename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			if !configuration.configuration.modTime.Equal(
+				time.Time{},
+			) {
+				configuration.configuration = &Configuration{}
+				return configuration.configuration, nil
+			}
+		}
+		return nil, err
+	}
+
+	if configuration.configuration.modTime.Equal(fi.ModTime()) &&
+		configuration.configuration.fileSize == fi.Size() {
+		return configuration.configuration, nil
+	}
+
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	d := json.NewDecoder(f)
+	d.DisallowUnknownFields()
+	var conf Configuration
+	err = d.Decode(&conf)
+	if err != nil {
+		return nil, err
+	}
+	configuration.configuration = &conf
+	return configuration.configuration, nil
+}
+
+// Description represents a group description together with some metadata
+// about the JSON file it was deserialised from.
 type Description struct {
 	// The file this was deserialised from.  This is not necessarily
 	// the name of the group, for example in case of a subgroup.
@@ -860,13 +924,19 @@ type Description struct {
 	Autokick bool `json:"autokick,omitempty"`
 
 	// A list of logins for ops.
-	Op []ClientCredentials `json:"op,omitempty"`
+	Op []ClientPattern `json:"op,omitempty"`
 
 	// A list of logins for presenters.
-	Presenter []ClientCredentials `json:"presenter,omitempty"`
+	Presenter []ClientPattern `json:"presenter,omitempty"`
 
 	// A list of logins for non-presenting users.
-	Other []ClientCredentials `json:"other,omitempty"`
+	Other []ClientPattern `json:"other,omitempty"`
+
+	// The URL of the authentication server.
+	AuthServer string `json:"authServer"`
+
+	// The (public) keys of the authentication server
+	AuthKeys []map[string]interface{} `json:"authKeys"`
 
 	// Codec preferences.  If empty, a suitable default is chosen in
 	// the APIFromNames function.
@@ -1007,92 +1077,13 @@ func GetDescription(name string) (*Description, error) {
 	return &desc, nil
 }
 
-type LdapProperty struct {
-	Field string   `json:"field,omitempty"` // name of a field
-	Begins string  `json:"begins,omitempty"` // how its value should begin
-}
-
-func (desc *Description) MatchLdapPassword(user string, password string) bool {
-	l, err := ldap.DialURL(desc.Ldapurl)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer l.Close()
-	err = l.Bind(
-		fmt.Sprintf("cn=%s,%s",
-			ldap.EscapeFilter(user),
-			desc.Ldapuserbranch),
-		password)
-	if err != nil {
-		return false
-	}
-	return true
-}
-
-func (desc *Description) CheckLdapProperties(user string, props []LdapProperty) (ok bool) {
-	ok = true
-	for _, prop := range props {
-		// ok will be ANDed with each property to check
-		l, err := ldap.DialURL(desc.Ldapurl)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer l.Close()
-		err = l.Bind(
-			fmt.Sprintf("cn=%s,%s",
-				ldap.EscapeFilter(desc.Ldapbinduser),
-				desc.Ldapuserbranch),
-			desc.Ldapbindpassword)
-		if err != nil {
-			ok = false
-			break
-		}
-		filter := fmt.Sprintf("(cn=%s)", ldap.EscapeFilter(user))
-		searchReq := ldap.NewSearchRequest(
-			desc.Ldapbase,
-			ldap.ScopeWholeSubtree, 0, 0, 0, false,
-			filter,
-			[]string{prop.Field},
-			[]ldap.Control{})
-		result, err := l.Search(searchReq)
-		if err != nil {
-			fmt.Errorf("failed to query LDAP: %w", err)
-		}
-		if len(result.Entries) == 0 {
-			ok = false
-			break
-		}
-		values := result.Entries[0].Attributes[0].Values[0]
-		if prop.Begins != strings.Split(values,",")[0]{
-			ok= false
-			break
-		}
-	}
-	return ok
-}
-
-func (desc *Description) GetPermission(group string, c Challengeable) (ClientPermissions, error) {
+func (desc *Description) GetPermission(group string, creds ClientCredentials) (ClientPermissions, error) {
 	var p ClientPermissions
-	/////////// Let us attempt to get permissions from LDAP //////////////
-	if len(desc.Ldapurl) > 0 {
-		if desc.MatchLdapPassword(c.Username(), c.Givenpassword()){
-			p.Op = desc.CheckLdapProperties(
-				c.Username(),
-				desc.Opldap)
-			p.Present = desc.CheckLdapProperties(
-				c.Username(),
-				desc.Presenterldap)
-			p.Record = desc.CheckLdapProperties(
-				c.Username(),
-				desc.Recordldap)
-			return p, nil
-		}
+	if !desc.AllowAnonymous && creds.Username == "" {
+		return p, ErrAnonymousNotAuthorised
 	}
-	/// No permissions got from LDAP, consider the group's description ///
-	if !desc.AllowAnonymous && c.Username() == "" {
-		return p, UserError("anonymous users not allowed in this group, please choose a username")
-	}
-	if found, good := matchClient(group, c, desc.Op); found {
+
+	if found, good := matchClient(group, creds, desc.Op); found {
 		if good {
 			p.Op = true
 			p.Present = true
@@ -1103,42 +1094,70 @@ func (desc *Description) GetPermission(group string, c Challengeable) (ClientPer
 		}
 		return p, ErrNotAuthorised
 	}
-	if found, good := matchClient(group, c, desc.Presenter); found {
+	if found, good := matchClient(group, creds, desc.Presenter); found {
 		if good {
 			p.Present = true
 			return p, nil
 		}
 		return p, ErrNotAuthorised
 	}
-	if found, good := matchClient(group, c, desc.Other); found {
+	if found, good := matchClient(group, creds, desc.Other); found {
 		if good {
 			return p, nil
 		}
 		return p, ErrNotAuthorised
 	}
+
+	if desc.AuthServer != "" && creds.Token != "" {
+		perms, err := token.Valid(
+			creds.Username, group, creds.Token, desc.AuthKeys,
+		)
+		if err != nil {
+			log.Printf("Token authentication: %v", err)
+			return p, ErrNotAuthorised
+		}
+		p.Op, _ = perms["op"].(bool)
+		p.Present, _ = perms["present"].(bool)
+		p.Record, _ = perms["record"].(bool)
+		return p, nil
+	}
+
 	return p, ErrNotAuthorised
 }
 
-type Public struct {
+type Status struct {
 	Name        string `json:"name"`
 	DisplayName string `json:"displayName,omitempty"`
 	Description string `json:"description,omitempty"`
+	AuthServer  string `json:"authServer,omitempty"`
 	Locked      bool   `json:"locked,omitempty"`
-	ClientCount int    `json:"clientCount"`
+	ClientCount *int   `json:"clientCount,omitempty"`
 }
 
-func GetPublic() []Public {
-	gs := make([]Public, 0)
+func GetStatus(g *Group, authentified bool) Status {
+	desc := g.Description()
+	d := Status{
+		Name:        g.name,
+		DisplayName: desc.DisplayName,
+		AuthServer:  desc.AuthServer,
+		Description: desc.Description,
+	}
+
+	if authentified || desc.Public {
+		// these are considered private information
+		locked, _ := g.Locked()
+		count := g.ClientCount()
+		d.Locked = locked
+		d.ClientCount = &count
+	}
+	return d
+}
+
+func GetPublic() []Status {
+	gs := make([]Status, 0)
 	Range(func(g *Group) bool {
-		if g.Public() {
-			locked, _ := g.Locked()
-			gs = append(gs, Public{
-				Name:        g.name,
-				DisplayName: g.DisplayName(),
-				Description: g.description.Description,
-				Locked:      locked,
-				ClientCount: len(g.clients),
-			})
+		if g.Description().Public {
+			gs = append(gs, GetStatus(g, false))
 		}
 		return true
 	})
@@ -1152,6 +1171,14 @@ func GetPublic() []Public {
 // list of public groups.  It also removes from memory any non-public
 // groups that haven't been accessed in maxHistoryAge.
 func Update() {
+	_, err := GetConfiguration()
+	if err != nil {
+		log.Printf("%v: %v",
+			filepath.Join(DataDirectory, "config.json"),
+			err,
+		)
+	}
+
 	names := GetNames()
 
 	for _, name := range names {
@@ -1172,7 +1199,7 @@ func Update() {
 		}
 	}
 
-	err := filepath.Walk(
+	err = filepath.Walk(
 		Directory,
 		func(path string, fi os.FileInfo, err error) error {
 			if err != nil {
@@ -1192,6 +1219,11 @@ func Update() {
 					"Unexpected extension for group file %v",
 					path,
 				)
+				return nil
+			}
+			base := filepath.Base(filename)
+			if base[0] == '.' {
+				log.Printf("Group file %v ignored", filename)
 				return nil
 			}
 			name := filename[:len(filename)-5]

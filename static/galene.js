@@ -26,6 +26,9 @@ let group;
 /** @type {ServerConnection} */
 let serverConnection;
 
+/** @type {Object} */
+let groupStatus = {};
+
 /**
  * @typedef {Object} userpass
  * @property {string} username
@@ -321,10 +324,38 @@ function setConnected(connected) {
 }
 
 /** @this {ServerConnection} */
-function gotConnected() {
+async function gotConnected() {
     setConnected(true);
     let up = getUserPass();
-    this.join(group, up.username, up.password);
+    try {
+        if(!groupStatus.authServer) {
+            this.join(group, up.username, up.password);
+        } else {
+            let r = await fetch(groupStatus.authServer, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    group: group,
+                    username: up.username,
+                    password: up.password,
+                }),
+            });
+            if(!r.ok) {
+                displayError(
+                    `The authorisation server said: ${r.status} ${r.statusText}`,
+                )
+                return
+            }
+            let token = await r.text();
+            this.join(group, up.username, null, token);
+        }
+    } catch(e) {
+        console.error(e);
+        displayError(e);
+        serverConnection.close();
+    }
 }
 
 /**
@@ -2111,7 +2142,8 @@ function setTitle(title) {
     }
     if(title)
         set(title);
-    set('Galène');
+    else
+        set('Galène');
 }
 
 
@@ -2142,6 +2174,7 @@ async function gotJoined(kind, group, perms, status, message) {
         return;
     case 'join':
     case 'change':
+        groupStatus = status;
         setTitle((status && status.displayName) || capitalise(group));
         displayUsername();
         setButtonsVisibility();
@@ -3088,9 +3121,22 @@ async function serverConnect() {
     }
 }
 
-function start() {
-    group = decodeURIComponent(location.pathname.replace(/^\/[a-z]*\//, ''));
-    setTitle(capitalise(group));
+async function start() {
+    group = decodeURIComponent(
+        location.pathname.replace(/^\/[a-z]*\//, '').replace(/\/$/, '')
+    );
+    /** @type {Object} */
+    try {
+        let r = await fetch(".status.json")
+        if(!r.ok)
+            throw new Error(`${r.status} ${r.statusText}`);
+        groupStatus = await r.json()
+    } catch(e) {
+        console.error(e);
+        return;
+    }
+
+    setTitle(groupStatus.displayName || capitalise(group));
     addFilters();
     setMediaChoices(false).then(e => reflectSettings());
 
