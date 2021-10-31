@@ -2,12 +2,13 @@
 
 import json
 import jwt
+import re
 from datetime import datetime, timezone, timedelta
 from aiohttp import web
 import aiohttp_cors
 from ldap3 import Server, Connection
 
-from credentials import credentials, private_crypto_key  
+from credentials import credentials, crypto_key  
 
 async def handler(request):
     body = await request.json()
@@ -18,6 +19,7 @@ async def handler(request):
     username = body["username"]
     # check whether the user can connect to the LDAP service
     conn=None
+    group=None
     try:
         conn=Connection(
             Server(credentials.ldap_host, port=credentials.ldap_port),
@@ -33,22 +35,24 @@ async def handler(request):
             search_filter = filtre,
             attributes = credentials.attributes
         )
-        print("THIS MAY BE USED:", conn.response)
+        # use conn.response to find the group this user belongs to
+        member_of = conn.response[0]["attributes"]["memberOf"]
+        m = re.match("^cn=([^,]+),.*", member_of[0], re.I)
+        group = m.group(1)
     except:
         return web.HTTPUnauthorized()
 
     now = datetime.now(tz=timezone.utc)
     token = {
         "sub": username,
-        "aud": body["group"],
+        "group": group,
         "permissions": {"present": True},
         "iat": now,
         "exp": now + timedelta(seconds=30),
     }
-    signed = jwt.encode(token, private_crypto_key, algorithm="HS256")
     return web.Response(
-        headers={"Content-Type": "aplication/jwt"},
-        body=signed,
+        headers={"Content-Type": "application/jwt"},
+        body=jwt.encode(token, crypto_key, algorithm="HS256"),
     )
 
 app = web.Application()
