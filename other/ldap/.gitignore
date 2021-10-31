@@ -1,3 +1,5 @@
 __pycache__/
 # The file credentials.py is supposed to contain passwords
 credentials.py
+# files only written for a local usage
+my_*
