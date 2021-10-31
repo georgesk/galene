@@ -5,13 +5,9 @@ import jwt
 from datetime import datetime, timezone, timedelta
 from aiohttp import web
 import aiohttp_cors
+from ldap3 import Server, Connection
 
-secret = b"\1\2\3\4"
-
-users = {
-    "john": "secret",
-    "peter": "secret2",
-}
+from credentials import credentials, private_crypto_key  
 
 async def handler(request):
     body = await request.json()
@@ -20,7 +16,25 @@ async def handler(request):
         return web.HTTPBadRequest()
 
     username = body["username"]
-    if not (username in users) or users[username] != body["password"]:
+    # check whether the user can connect to the LDAP service
+    conn=None
+    try:
+        conn=Connection(
+            Server(credentials.ldap_host, port=credentials.ldap_port),
+            user=body["username"],
+            password=body["password"],
+            check_names=True,
+            raise_exceptions=True
+        )
+        conn.bind()
+        filtre  = f'(&(objectClass={credentials.account_field})(cn={body["username"]}))'
+        conn.search(
+            search_base = credentials.user_branch,
+            search_filter = filtre,
+            attributes = credentials.attributes
+        )
+        print("HELLO conn.response = ", conn.response)
+    except:
         return web.HTTPUnauthorized()
 
     now = datetime.now(tz=timezone.utc)
@@ -31,7 +45,7 @@ async def handler(request):
         "iat": now,
         "exp": now + timedelta(seconds=30),
     }
-    signed = jwt.encode(token, secret, algorithm="HS256")
+    signed = jwt.encode(token, private_crypto_key, algorithm="HS256")
     return web.Response(
         headers={"Content-Type": "aplication/jwt"},
         body=signed,

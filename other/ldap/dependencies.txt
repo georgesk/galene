@@ -1,0 +1,5 @@
+Dependencies (for Debian)
+-------------------------
+
+pyton3-aiohttp-cors
+python-ldap3
