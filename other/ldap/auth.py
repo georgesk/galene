@@ -21,7 +21,7 @@ async def handler(request):
     try:
         conn=Connection(
             Server(credentials.ldap_host, port=credentials.ldap_port),
-            user=body["username"],
+            user=f'cn={body["username"]},{credentials.user_branch}',
             password=body["password"],
             check_names=True,
             raise_exceptions=True
@@ -33,7 +33,7 @@ async def handler(request):
             search_filter = filtre,
             attributes = credentials.attributes
         )
-        print("HELLO conn.response = ", conn.response)
+        print("THIS MAY BE USED:", conn.response)
     except:
         return web.HTTPUnauthorized()
 
